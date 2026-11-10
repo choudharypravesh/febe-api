@@ -1,0 +1,76 @@
+name: Update Vercel env var
+
+on:
+  workflow_dispatch:
+    inputs:
+      key:
+        description: "Variable name (must be on the allowlist)"
+        required: true
+        type: string
+      value:
+        description: "New value"
+        required: true
+        type: string
+      target:
+        description: "Environment"
+        required: true
+        type: choice
+        default: preview
+        options: [preview, production]
+
+permissions: {}
+
+concurrency:
+  group: vercel-env-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      KEY: ${{ inputs.key }}
+      VALUE: ${{ inputs.value }}
+      TARGET: ${{ inputs.target }}
+      ACTOR: ${{ github.actor }}
+      ALLOWED_KEYS: ${{ vars.ALLOWED_ENV_KEYS }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      DEPLOY_HOOK_URL: ${{ secrets.VERCEL_DEPLOY_HOOK_URL }}
+    steps:
+      - name: Mask the value in logs
+        run: echo "::add-mask::$VALUE"
+
+      - name: Validate the variable name
+        run: |
+          if ! [[ "$KEY" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "::error::'$KEY' is not a valid variable name"; exit 1
+          fi
+          if ! tr ',' '\n' <<< "$ALLOWED_KEYS" | grep -qxF "$KEY"; then
+            echo "::error::'$KEY' is not on the allowlist. Ask the repo owner to add it to ALLOWED_ENV_KEYS."; exit 1
+          fi
+
+      - name: Update the variable in Vercel
+        run: |
+          BODY=$(jq -n --arg key "$KEY" --arg value "$VALUE" --arg target "$TARGET" \
+            '{key: $key, value: $value, type: "encrypted", target: [$target]}')
+
+          STATUS=$(curl -sS -o response.json -w '%{http_code}' -X POST \
+            "https://api.vercel.com/v10/projects/${VERCEL_PROJECT_ID}/env?upsert=true" \
+            -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+
+          if [ "$STATUS" -ge 300 ]; then
+            echo "::error::Vercel API returned $STATUS: $(jq -r '.error.message // "unknown error"' response.json)"
+            exit 1
+          fi
+          rm -f response.json
+
+      - name: Redeploy production
+        if: inputs.target == 'production'
+        run: curl -sS -f -X POST "$DEPLOY_HOOK_URL" > /dev/null
+
+      - name: Record who changed what
+        run: |
+          echo "**$ACTOR** updated \`$KEY\` in **$TARGET**" >> "$GITHUB_STEP_SUMMARY"
